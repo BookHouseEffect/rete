@@ -13,12 +13,21 @@ interface EngineNode extends NodeData {
     outputData: WorkerOutputs;
 }
 
+interface DependencyGraph { 
+    nodeId: number; 
+    nodeDependsOnIds: number[]; 
+    addedToOrder: boolean; 
+}
+
 export class Engine extends Context<EventsTypes> {
 
     args: unknown[] = [];
     data: Data | null = null;
     state = State.AVAILABLE;
     onAbort = () => { };
+
+    private dependencies: { [key: string]: DependencyGraph } = {};
+    private processingOrder: number[] = [];
 
     constructor(id: string) {
         super(id, new EngineEvents());
@@ -157,15 +166,13 @@ export class Engine extends Context<EventsTypes> {
         if (this.state === State.ABORT)
             return null;
 
-        return await Promise.all(Object.keys(node.outputs).map(async (key) => {
-            const output = node.outputs[key];
-            
-            return await Promise.all(output.connections.map(async (c) => {
-                const nextNode = (this.data as Data).nodes[c.node];
+        const index = this.processingOrder.indexOf(node.id);
+        const nextNodesIds = this.processingOrder.slice(index + 1);
+       
+        return await Promise.all(nextNodesIds.map(async (n) => {
+            const nextNode = (this.data as Data).nodes[n];
 
-                await this.processNode(nextNode as EngineNode);
-                await this.forwardProcess(nextNode);
-            }));
+            await this.processNode(nextNode as EngineNode);
         }));
     }
 
@@ -194,6 +201,64 @@ export class Engine extends Context<EventsTypes> {
         return true;
     }
 
+    private addNodeToProcessingOrder(x: DependencyGraph) {
+        if (this.state === State.ABORT)
+            return null;
+
+        for (let n in x.nodeDependsOnIds) {
+            const item = x.nodeDependsOnIds[+n];
+            const dependency = this.dependencies[`${item}`];
+
+            if (!dependency.addedToOrder && this.processingOrder.indexOf(item) === -1) {
+                dependency.addedToOrder = true;
+                this.addNodeToProcessingOrder(dependency);
+            }
+        }
+        
+        if (this.processingOrder.indexOf(x.nodeId) === -1) {
+            x.addedToOrder = true;
+            this.processingOrder.push(x.nodeId);
+        }
+    }
+
+    private buildDependencyGraph() {
+        if (this.state === State.ABORT)
+            return null;
+        
+        this.dependencies = {};  
+        const data = this.data as Data;
+
+        Object.keys(data.nodes).forEach(key => {
+            const node = data.nodes[key];
+
+            const dependsOn = ([] as number[]).concat.apply([], Object.keys(node.inputs).map(inKey => {
+                return node.inputs[inKey].connections.map(x => x.node);
+            })).filter((value, index, array) => { 
+                return array.indexOf(value) === index 
+            });
+
+            this.dependencies[key] = {
+                nodeId: node.id,
+                nodeDependsOnIds: dependsOn,
+                addedToOrder: false
+            };
+        });
+    }
+
+    private buildProcessingOrder() {
+        if (this.state === State.ABORT)
+            return null;
+
+        this.processingOrder = [];
+        for (let i in this.dependencies) {
+            if (!this.dependencies[i].addedToOrder && 
+                this.processingOrder.indexOf(this.dependencies[i].nodeId) === -1) {
+                this.dependencies[i].addedToOrder = true;
+                this.addNodeToProcessingOrder(this.dependencies[i]);
+            }
+        }
+    }
+
     private async processStartNode(id: string | number | null) {
         if (!id) return;
 
@@ -206,29 +271,21 @@ export class Engine extends Context<EventsTypes> {
         await this.forwardProcess(startNode);
     }
 
-    private async processUnreachable() {
-        const data = this.data as Data;
-
-        for (let i in data.nodes) { // process nodes that have not been reached
-            const node = data.nodes[i] as EngineNode;
-
-            if (typeof node.outputData === 'undefined') {
-                await this.processNode(node);
-                await this.forwardProcess(node);
-            }
-        }
-    }
-
     async process<T extends unknown[]>(data: Data, startId: number | string | null = null, ...args: T) {
         if (!this.processStart()) return;
         if (!this.validate(data)) return;    
         
         this.data = this.copy(data);
         this.args = args;
+
+        this.buildDependencyGraph();
+        this.buildProcessingOrder();
+        console.debug(startId);
         
-        await this.processStartNode(startId);
-        await this.processUnreachable();
-        
+        const id = this.processingOrder.length ? this.processingOrder[0] : null;
+
+        await this.processStartNode(id);
+
         return this.processDone()?'success':'aborted';
     }
 }
