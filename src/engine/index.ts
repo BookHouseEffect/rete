@@ -28,6 +28,7 @@ export class Engine extends Context<EventsTypes> {
 
     private dependencies: { [key: string]: DependencyGraph } = {};
     private processingOrder: number[] = [];
+    private processChunks: number[][] = [];
 
     constructor(id: string) {
         super(id, new EngineEvents());
@@ -166,13 +167,14 @@ export class Engine extends Context<EventsTypes> {
         if (this.state === State.ABORT)
             return null;
 
-        const index = this.processingOrder.indexOf(node.id);
-        const nextNodesIds = this.processingOrder.slice(index + 1);
+        console.debug(node);
        
-        return await Promise.all(nextNodesIds.map(async (n) => {
-            const nextNode = (this.data as Data).nodes[n];
+        return Promise.all(this.processChunks.map(async (chunk) => {
+            await Promise.all(chunk.map(async (id) => {
+                const nextNode = (this.data as Data).nodes[id];
 
-            await this.processNode(nextNode as EngineNode);
+                return this.processNode(nextNode as EngineNode)
+            }));
         }));
     }
 
@@ -221,6 +223,40 @@ export class Engine extends Context<EventsTypes> {
         }
     }
 
+    private convertToChunks() {
+        this.processChunks = [];
+        let chunk: number[] = [];
+        const checkFn = (x: number) => chunk.indexOf(x) !== -1;
+
+        for (let i in this.processingOrder) {
+            const dependsOn = this.dependencies[this.processingOrder[i]].nodeDependsOnIds;
+
+            if (dependsOn.some(checkFn)) {
+                this.processChunks.push(chunk);
+                chunk = [];
+                continue;
+            }
+
+            chunk.push(this.processingOrder[i]);
+        }
+    }
+
+    private buildProcessingOrder() {
+        if (this.state === State.ABORT)
+            return null;
+
+        this.processingOrder = [];
+        for (let i in this.dependencies) {
+            if (!this.dependencies[i].addedToOrder && 
+                this.processingOrder.indexOf(this.dependencies[i].nodeId) === -1) {
+                this.dependencies[i].addedToOrder = true;
+                this.addNodeToProcessingOrder(this.dependencies[i]);
+            }
+        }
+
+        this.convertToChunks();
+    }
+
     private buildDependencyGraph() {
         if (this.state === State.ABORT)
             return null;
@@ -243,20 +279,8 @@ export class Engine extends Context<EventsTypes> {
                 addedToOrder: false
             };
         });
-    }
 
-    private buildProcessingOrder() {
-        if (this.state === State.ABORT)
-            return null;
-
-        this.processingOrder = [];
-        for (let i in this.dependencies) {
-            if (!this.dependencies[i].addedToOrder && 
-                this.processingOrder.indexOf(this.dependencies[i].nodeId) === -1) {
-                this.dependencies[i].addedToOrder = true;
-                this.addNodeToProcessingOrder(this.dependencies[i]);
-            }
-        }
+        this.buildProcessingOrder();
     }
 
     private async processStartNode(id: string | number | null) {
@@ -279,7 +303,6 @@ export class Engine extends Context<EventsTypes> {
         this.args = args;
 
         this.buildDependencyGraph();
-        this.buildProcessingOrder();
         console.debug(startId);
         
         const id = this.processingOrder.length ? this.processingOrder[0] : null;
